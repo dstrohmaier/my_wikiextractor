@@ -1429,10 +1429,10 @@ class Extractor():
             ## ! : handles some errores when expanding templates
             # notelist : 
             return ''
-        elif(title.lower() in self.ignoreTemplates):
+        elif(self.ignoreTemplates and title.lower() in self.ignoreTemplates):
             # Not expanding manually specified templates
             return ''
-        elif(title.lower() in self.discardTemplates): 
+        elif(self.discardTemplates and title.lower() in self.discardTemplates):
             #this whole doc is gonna be discarded
             return None
 
