@@ -302,7 +302,7 @@ def compact(text, mark_headers=False):
             title = m.group(2)
 
             # Discard non-desired sections
-            if(title.lower() in Extractor.discardSections):
+            if(Extractor.discardSections and title.lower() in Extractor.discardSections):
                 skipSection = True              
                 emptySection = True
                 continue
