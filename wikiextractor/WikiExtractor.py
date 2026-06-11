@@ -41,7 +41,6 @@ import logging
 import os.path
 import re  # TODO use regex when it will be standard
 import sys
-from io import StringIO
 from timeit import default_timer
 import inspect
 extract_path = os.path.realpath(os.path.abspath(os.path.join(os.path.split(inspect.getfile( inspect.currentframe() ))[0],"extract")))
@@ -56,7 +55,7 @@ logging.basicConfig(format=FORMAT)
 # ===========================================================================
 
 # Program version
-__version__ = '4.0'
+__version__ = '4.1'
 
 ##
 # Defined in <siteinfo>
@@ -173,19 +172,16 @@ class OutputSplitter():
 
     def write(self, data):
         self.reserve(len(data))
-        if self.compress:
-            self.file.write(data)
-        else:
-            self.file.write(data)
+        self.file.write(data)
 
     def close(self):
         self.file.close()
 
     def open(self, filename):
         if self.compress:
-            return bz2.BZ2File(filename + '.bz2', 'w')
+            return bz2.open(filename + '.bz2', 'wt', encoding='utf-8')
         else:
-            return open(filename, 'w')
+            return open(filename, 'w', encoding='utf-8')
 
 
 # ----------------------------------------------------------------------
@@ -526,7 +522,7 @@ def process_dump_script(input_opened,input_file, out_file, file_size, file_compr
     if (out_file == '-'):
         output = sys.stdout
         if file_compress:
-            logging.warn("writing to stdout, so no output compression (use an external tool)")
+            logging.warning("writing to stdout, so no output compression (use an external tool)")
     else:
         #output = out_file
         nextFile = NextFile(out_file,file_extension)
@@ -571,8 +567,8 @@ def process_dump_generator(input_opened,input_file, urlbase):
     extract_start = default_timer()
 
     ordinal = 1  # page count
-    for id, revid, title, page in collect_pages(input_opened): 
-        doc_info = Extractor(ordinal, revid, urlbase, title, page).extract(out=None, html_safe=True)
+    for id, revid, title, page, metadata in collect_pages(input_opened):
+        doc_info = Extractor(ordinal, revid, urlbase, title, page, metadata).extract(out=None, html_safe=True)
         if (doc_info):
             ordinal += 1
             yield doc_info
@@ -681,12 +677,12 @@ def main(*args, **kwargs):
     groupP.add_argument("--discard_templates", action="store_true",
                         help="If specified, it will discard \
                               some wikipedia docs if containg some templates titles (e.g. Disambiguation, Desambiguación). \
-                              \Since most template names are usually tranlated.  \
+                              Since most template names are usually tranlated.  \
                                 See an example under config/discard_templates.txt ")
     groupP.add_argument("--ignore_templates", action="store_true",
                         help="If specified, it will not expand \
                               some templates (e.g. Millorar format). \
-                              \Since most template names are usually tranlated.  \
+                              Since most template names are usually tranlated.  \
                                 See an example under config/ignore_templates.txt ")
     groupP.add_argument("--html_safe", default=True,
                         help="use to produce HTML safe output within <doc>...</doc>")
