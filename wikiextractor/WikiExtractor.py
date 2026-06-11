@@ -37,7 +37,9 @@ collecting template definitions.
 
 import argparse
 import bz2
+import io
 import logging
+import multiprocessing as mp
 import os.path
 import re  # TODO use regex when it will be standard
 import sys
@@ -47,6 +49,10 @@ extract_path = os.path.realpath(os.path.abspath(os.path.join(os.path.split(inspe
 if extract_path not in sys.path:
      sys.path.insert(0, extract_path)
 from extract import Extractor, ignoreTag, define_template, acceptedNamespaces
+# The module object where Extractor (and the template globals) are defined.
+# Resolved via __module__ so it works whether 'extract' imports as a package
+# (extract.extract) or as a bare module (the sys.path hack above).
+extract_mod = sys.modules[Extractor.__module__]
 
 
 FORMAT = '[%(asctime)s][%(name)s][%(levelname)s] - %(message)s'
@@ -164,15 +170,20 @@ class OutputSplitter():
         self.compress = compress
         self.max_file_size = max_file_size
         self.file = self.open(self.nextFile.next())
+        # Track written size ourselves: a text-wrapped bz2 stream is not
+        # seekable, so file.tell() is unavailable when compressing.
+        self.file_size = 0
 
     def reserve(self, size):
-        if self.file.tell() + size > self.max_file_size:
+        if self.file_size + size > self.max_file_size:
             self.close()
             self.file = self.open(self.nextFile.next())
+            self.file_size = 0
 
     def write(self, data):
         self.reserve(len(data))
         self.file.write(data)
+        self.file_size += len(data)
 
     def close(self):
         self.file.close()
@@ -590,22 +601,171 @@ def process_dump_generator(input_opened,input_file, urlbase):
 
 
 
-def reduce_process(output_queue, output):
+# ----------------------------------------------------------------------
+# Multiprocessing
+
+# Sentinel a worker puts on the output queue to signal it has finished.
+# A dedicated value so it is never confused with a per-page (ordinal, None)
+# pair, where None marks a page that was discarded and produced no text.
+_WORKER_DONE = "__WIKIEXTRACTOR_WORKER_DONE__"
+
+# extract.extract module globals that must be reconstructed in spawn workers
+# (under fork they are inherited via copy-on-write and need no copying).
+# ignored_tag_patterns matters because main() calls ignoreTag('a') when links
+# are not kept; compiled regex patterns are picklable.
+_SHARED_MODULE_GLOBALS = ('templates', 'redirects', 'templateCache',
+                          'knownNamespaces', 'acceptedNamespaces',
+                          'ignored_tag_patterns')
+# Extractor class attributes set before extraction and read during it.
+_SHARED_EXTRACTOR_ATTRS = ('keepLinks', 'keepSections', 'HtmlFormatting',
+                           'templatePrefix', 'discardSections',
+                           'discardTemplates', 'ignoreTemplates', 'to_json',
+                           'to_txt', 'markdown', 'generator', 'language')
+
+
+def _worker_state_bundle():
     """
-    Pull finished article text, write series of files (or stdout)
-    :param output_queue: text to be output.
-    :param output: file object where to print.
+    Build a picklable snapshot of all module/class state a spawn worker needs.
+    Only used under the 'spawn' start method; fork workers inherit this state.
     """
+    bundle = {'module': {}, 'extractor': {}}
+    for name in _SHARED_MODULE_GLOBALS:
+        bundle['module'][name] = getattr(extract_mod, name)
+    for name in _SHARED_EXTRACTOR_ATTRS:
+        bundle['extractor'][name] = getattr(Extractor, name)
+    return bundle
+
+
+def init_worker(state_bundle):
+    """
+    Pool/Process initializer. Under spawn (state_bundle is not None), repopulate
+    the extract.extract module globals and Extractor class attributes from the
+    bundle. Under fork (state_bundle is None) this is a no-op: the child already
+    inherited the state.
+    """
+    if state_bundle is None:
+        return
+    for name, value in state_bundle['module'].items():
+        setattr(extract_mod, name, value)
+    for name, value in state_bundle['extractor'].items():
+        setattr(Extractor, name, value)
+
+
+def extract_worker(jobs_queue, output_queue, urlbase, state_bundle):
+    """
+    Worker process: pull (ordinal, pagedata) jobs until a None sentinel, extract
+    each page into a string, and put (ordinal, text) on output_queue (text is
+    None for discarded or failed pages). Forward _WORKER_DONE on completion.
+    """
+    init_worker(state_bundle)
+    while True:
+        job = jobs_queue.get()
+        if job is None:  # no more work
+            output_queue.put(_WORKER_DONE)
+            return
+        ordinal, (id, revid, title, page, metadata) = job
+        out = io.StringIO()
+        try:
+            kept = Extractor(id, revid, urlbase, title, page, metadata).extract(
+                out, html_safe=True)
+        except Exception:
+            logging.exception("Failed to extract page %s (%s)", title, id)
+            kept = False
+        output_queue.put((ordinal, out.getvalue() if kept else None))
+
+
+def process_dump_parallel(input_opened, input_file, out_file, file_size,
+                          file_compress, file_extension, urlbase, process_count):
+    """
+    Multi-process replacement for process_dump_script. Spawns process_count
+    worker processes plus a single reducer process that writes docs in the
+    original page order via OutputSplitter.
+    """
+    # Prefer fork (free copy-on-write sharing of the template dict); fall back
+    # to spawn (macOS/Windows, or future Linux) with explicit state copying.
+    if 'fork' in mp.get_all_start_methods():
+        ctx = mp.get_context('fork')
+        state_bundle = None
+    else:
+        ctx = mp.get_context('spawn')
+        state_bundle = _worker_state_bundle()
+
+    maxsize = 10 * process_count
+    jobs_queue = ctx.Queue(maxsize=maxsize)
+    output_queue = ctx.Queue(maxsize=maxsize)
+
+    logging.info("Starting page extraction from %s using %d processes.",
+                 input_file, process_count)
+    extract_start = default_timer()
+
+    # The reducer builds its own OutputSplitter: an open file handle can't be
+    # pickled to a spawn child, so we pass construction params, not the object.
+    reducer = ctx.Process(target=reduce_process,
+                          args=(output_queue, process_count, out_file,
+                                file_size, file_compress, file_extension))
+    reducer.start()
+
+    workers = []
+    for _ in range(process_count):
+        w = ctx.Process(target=extract_worker,
+                        args=(jobs_queue, output_queue, urlbase, state_bundle))
+        w.start()
+        workers.append(w)
+
+    # Feed pages with 0-based ordinals (matches reduce_process next_ordinal=0).
+    ordinal = 0
+    for page_data in collect_pages(input_opened):
+        jobs_queue.put((ordinal, page_data))
+        ordinal += 1
+    input_opened.close()
+
+    # Signal workers to finish, then wait for the whole pipeline to drain.
+    for _ in workers:
+        jobs_queue.put(None)
+    for w in workers:
+        w.join()
+    reducer.join()  # reducer closes the output file when done
+
+    extract_duration = default_timer() - extract_start
+    extract_rate = ordinal / extract_duration if extract_duration else 0
+    logging.info("Finished %d-process extraction of %d articles in %.1fs (%.1f art/s)",
+                 process_count, ordinal, extract_duration, extract_rate)
+
+
+def reduce_process(output_queue, num_workers, out_file, file_size,
+                   file_compress, file_extension):
+    """
+    Pull finished article text, write series of files preserving the original
+    page order. Runs as the single writer process and owns the output files.
+    The OutputSplitter is built here (not passed in) because an open file
+    handle is not picklable and so cannot cross a spawn process boundary.
+    :param output_queue: queue carrying (ordinal, text) pairs, where text is
+        the serialized doc or None for a page that was discarded; and
+        _WORKER_DONE sentinels, one per worker, signalling completion.
+    :param num_workers: number of worker processes feeding the queue; the
+        reducer stops once it has seen this many _WORKER_DONE sentinels.
+    :param out_file, file_size, file_compress, file_extension: OutputSplitter
+        construction parameters (same as the serial path).
+    """
+
+    output = OutputSplitter(NextFile(out_file, file_extension), file_size,
+                            file_compress)
 
     interval_start = default_timer()
     period = 100000
     # FIXME: use a heap
-    ordering_buffer = {}  # collected pages
+    ordering_buffer = {}  # collected pages, keyed by ordinal
     next_ordinal = 0  # sequence number of pages
+    workers_remaining = num_workers
     while True:
         if next_ordinal in ordering_buffer:
-            output.write(ordering_buffer.pop(next_ordinal))
+            text = ordering_buffer.pop(next_ordinal)
             next_ordinal += 1
+            if text is None:
+                # Discarded page: advance past it without writing, so the
+                # ordinal sequence stays contiguous and never deadlocks.
+                continue
+            output.write(text)
             # progress report
             if next_ordinal % period == 0:
                 interval_rate = period / (default_timer() - interval_start)
@@ -613,12 +773,17 @@ def reduce_process(output_queue, output):
                              next_ordinal, interval_rate)
                 interval_start = default_timer()
         else:
-            # mapper puts None to signal finish
-            pair = output_queue.get()
-            if not pair:
-                break
-            ordinal, text = pair
+            item = output_queue.get()
+            if item == _WORKER_DONE:
+                workers_remaining -= 1
+                if workers_remaining == 0:
+                    break
+                continue
+            ordinal, text = item
             ordering_buffer[ordinal] = text
+
+    # The reducer owns the output file handles, so it closes them.
+    output.close()
 
 
 def main(*args, **kwargs):
@@ -688,6 +853,9 @@ def main(*args, **kwargs):
                         help="use to produce HTML safe output within <doc>...</doc>")
     groupP.add_argument("-ns", "--namespaces", default="", metavar="ns1,ns2",
                         help="accepted namespaces")
+    groupP.add_argument("--processes", "-p", type=int, default=1,
+                        help="number of extraction processes (default 1 = serial); "
+                             "use more on multi-core machines, e.g. the CPU count")
 
     groupS = parser.add_argument_group('Special')
     groupS.add_argument("-q", "--quiet", action="store_true",
@@ -772,11 +940,28 @@ def main(*args, **kwargs):
                                                 expand_templates=bool(args.templates)
                                             )
 
+    process_count = max(1, args.processes)
+
     if (args.generator): #Using the tool as a module
+        # Generator mode yields back into the caller's process: always single-process.
         return process_dump_generator(input_opened,input_file, urlbase)
 
-    else:  #Using the tool as a a script
-        process_dump_script(    input_opened = input_opened, 
+    elif process_count > 1 and output_path != '-':  #Multi-process script extraction
+        process_dump_parallel(  input_opened = input_opened,
+                                input_file = input_file,
+                                out_file = output_path,
+                                file_size=file_size,
+                                file_compress=args.compress,
+                                file_extension=file_extension,
+                                urlbase = urlbase,
+                                process_count = process_count
+                            )
+
+    else:  #Using the tool as a a script (serial)
+        if process_count > 1:
+            # stdout output can't be written from multiple processes without interleaving.
+            logging.info("writing to stdout, so falling back to single-process extraction")
+        process_dump_script(    input_opened = input_opened,
                                 input_file = input_file,
                                 out_file = output_path,
                                 file_size=file_size,
