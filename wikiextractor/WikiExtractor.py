@@ -42,6 +42,9 @@ import logging
 import multiprocessing as mp
 import os.path
 import re  # TODO use regex when it will be standard
+import shutil
+import signal
+import subprocess
 import sys
 from timeit import default_timer
 import inspect
@@ -286,12 +289,48 @@ def load_templates(file, output_file=None):
     return templates
 
 
+# External decompressors, in order of preference: parallel tools first, then
+# the single-threaded classics. Decompressing in a subprocess moves that work
+# off the main (reader) process, which is otherwise its dominant cost.
+_DECOMPRESSORS = {
+    '.bz2': (['lbzip2', '-dc'], ['pbzip2', '-dc'], ['bzcat']),
+    '.gz': (['pigz', '-dc'], ['zcat'],),
+}
+
+
+class _PipeTextReader(io.TextIOWrapper):
+    """Text reader over an external decompressor's stdout that reaps the
+    subprocess on close and surfaces decompression failures."""
+
+    def __init__(self, proc, encoding):
+        self._proc = proc
+        super().__init__(proc.stdout, encoding=encoding)
+
+    def close(self):
+        super().close()
+        returncode = self._proc.wait()
+        # -SIGPIPE is expected when we close before reading to EOF.
+        if returncode not in (0, -signal.SIGPIPE):
+            logging.error("decompressor exited with code %s: output may be "
+                          "truncated", returncode)
+
+
 def decode_open(filename, mode='rt', encoding='utf-8'):
     """
     Open a file, decode and decompress, depending on extension `gz`, or 'bz2`.
+    Prefers piping through an external decompressor (lbzip2/pbzip2/bzcat,
+    pigz/zcat) so decompression runs outside this process; falls back to the
+    Python codecs when no tool is available.
     :param filename: the file to open.
     """
     ext = os.path.splitext(filename)[1]
+    if ext in _DECOMPRESSORS and mode == 'rt' and os.path.isfile(filename):
+        for cmd in _DECOMPRESSORS[ext]:
+            if shutil.which(cmd[0]):
+                proc = subprocess.Popen(cmd + [filename],
+                                        stdout=subprocess.PIPE,
+                                        bufsize=2 ** 20)
+                return _PipeTextReader(proc, encoding=encoding)
     if ext == '.gz':
         import gzip
         return gzip.open(filename, mode, encoding=encoding)
@@ -609,6 +648,10 @@ def process_dump_generator(input_opened,input_file, urlbase):
 # pair, where None marks a page that was discarded and produced no text.
 _WORKER_DONE = "__WIKIEXTRACTOR_WORKER_DONE__"
 
+# Pages per jobs_queue item. Batching amortizes pickling and pipe syscalls,
+# which otherwise throttle the single feeder process.
+_JOB_BATCH_SIZE = 32
+
 # extract.extract module globals that must be reconstructed in spawn workers
 # (under fork they are inherited via copy-on-write and need no copying).
 # ignored_tag_patterns matters because main() calls ignoreTag('a') when links
@@ -653,9 +696,10 @@ def init_worker(state_bundle):
 
 def extract_worker(jobs_queue, output_queue, urlbase, state_bundle):
     """
-    Worker process: pull (ordinal, pagedata) jobs until a None sentinel, extract
-    each page into a string, and put (ordinal, text) on output_queue (text is
-    None for discarded or failed pages). Forward _WORKER_DONE on completion.
+    Worker process: pull (base_ordinal, [pagedata, ...]) batches until a None
+    sentinel, extract each page into a string, and put per-page
+    (ordinal, text) pairs on output_queue (text is None for discarded or
+    failed pages). Forward _WORKER_DONE on completion.
     """
     init_worker(state_bundle)
     while True:
@@ -663,15 +707,17 @@ def extract_worker(jobs_queue, output_queue, urlbase, state_bundle):
         if job is None:  # no more work
             output_queue.put(_WORKER_DONE)
             return
-        ordinal, (id, revid, title, page, metadata) = job
-        out = io.StringIO()
-        try:
-            kept = Extractor(id, revid, urlbase, title, page, metadata).extract(
-                out, html_safe=True)
-        except Exception:
-            logging.exception("Failed to extract page %s (%s)", title, id)
-            kept = False
-        output_queue.put((ordinal, out.getvalue() if kept else None))
+        base_ordinal, batch = job
+        for i, (id, revid, title, page, metadata) in enumerate(batch):
+            out = io.StringIO()
+            try:
+                kept = Extractor(id, revid, urlbase, title, page,
+                                 metadata).extract(out, html_safe=True)
+            except Exception:
+                logging.exception("Failed to extract page %s (%s)", title, id)
+                kept = False
+            output_queue.put((base_ordinal + i,
+                              out.getvalue() if kept else None))
 
 
 def process_dump_parallel(input_opened, input_file, out_file, file_size,
@@ -712,11 +758,21 @@ def process_dump_parallel(input_opened, input_file, out_file, file_size,
         w.start()
         workers.append(w)
 
-    # Feed pages with 0-based ordinals (matches reduce_process next_ordinal=0).
+    # Feed pages in batches to amortize queue/pickling overhead. Ordinals are
+    # 0-based (matches reduce_process next_ordinal=0); a batch carries the
+    # ordinal of its first page.
     ordinal = 0
+    batch_base = 0
+    batch = []
     for page_data in collect_pages(input_opened):
-        jobs_queue.put((ordinal, page_data))
+        batch.append(page_data)
         ordinal += 1
+        if len(batch) == _JOB_BATCH_SIZE:
+            jobs_queue.put((batch_base, batch))
+            batch_base = ordinal
+            batch = []
+    if batch:
+        jobs_queue.put((batch_base, batch))
     input_opened.close()
 
     # Signal workers to finish, then wait for the whole pipeline to drain.
